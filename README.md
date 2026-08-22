@@ -52,7 +52,7 @@ python main.py
 或者
 
 ```bash
-momitor.exe
+momitor.exe #暂未实现 欢迎各位大佬push仓库到main分支
 ```
 
 
