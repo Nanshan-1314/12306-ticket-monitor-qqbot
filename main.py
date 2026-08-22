@@ -272,7 +272,12 @@ def choose_seat(keys):
 
 def ask_interval(default):
     while True:
-        s = ask("查询间隔（最低 10min一次）", default) #既然你看到这里了 证明你有实力改 那么自己动手调吧 注意防止风控
+        s = ask("查询间隔（最低 10min一次）", default) 
+        # 【法律与安全警告】修改此处的查询间隔存在导致IP/账号被12306风控封禁的风险。
+        # 作者已设定最低10分钟的安全阈值。若您强行修改此值，即表示：
+        # 1. 您已完全阅读并理解本项目的免责声明（https://github.com/Nanshan-1314/12306-ticket-monitor-qqbot/blob/main/DISCLAIMER.md）；
+        # 2. 您明确知晓该行为可能违反第三方平台服务协议；
+        # 3. 您自愿承担由此导致的一切账号封禁、IP屏蔽及潜在和连带的法律后果。
         if s.isdigit() and int(s) >= 10:
             return s
         print("间隔需为不小于 10 的整数。")
@@ -330,7 +335,7 @@ def notify_text(cfg):
 
 def send_test(cfg):
     token = qqbot.get_access_token(cfg["QQ_APPID"], cfg["QQ_APPSECRET"])
-    r = qqbot.send_c2c(token, cfg["QQ_OPENID"], "这是一条 12306 监控测试消息 如果你看到了这条消息 则证明QQBot配置正常", api_base_for(cfg))
+    r = qqbot.send_c2c(token, cfg["QQ_OPENID"], "这是一条测试消息 如果你看到了这条消息 则证明QQBot配置正常", api_base_for(cfg))
     print("测试消息已发送:", json.dumps(r, ensure_ascii=False))
 
 
