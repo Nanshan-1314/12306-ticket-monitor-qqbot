@@ -4,7 +4,7 @@
 >
 > 使用者应当合理、审慎地使用本源码及其衍生品，并自行承担因不当使用所引发的一切法律及安全责任。
 > 
->使用前务必阅读 [免责声明](https://github.com/Nanshan-1314/12306-ticket-monitor-qqbot/blob/main/DISCLAIMER.md)
+> **使用本项目即表示您已完全阅读、理解并同意** [免责声明](https://github.com/Nanshan-1314/12306-ticket-monitor-qqbot/blob/main/DISCLAIMER.md)
 > 
 >技术本身是工具，无论您是将本工具用于个人查票，还是基于学习目的进行二次开发，所有操作行为均由您自己控制。作者无法（也没有权限）干预您本地修改后的代码。
 >
