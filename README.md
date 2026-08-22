@@ -54,7 +54,7 @@ python main.py
 或者
 
 ```bash
-momitor.exe #暂未实现 欢迎各位大佬push仓库到main分支
+momitor.exe #暂未实现 欢迎各位大佬push仓库到main分支 鉴于目前Agent发展迅速 暂不考虑喂饭
 ```
 
 
