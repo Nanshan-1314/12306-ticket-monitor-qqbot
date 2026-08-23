@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 
 from mcp_client import MCPClient
@@ -32,6 +33,7 @@ SEAT_NAMES = {
 REQUIRED = ["QQ_APPID", "QQ_APPSECRET", "QQ_OPENID", "FROM_STATION", "TO_STATION",
             "TRAIN_NO", "TRAIN_DATE", "SEAT_KEY", "INTERVAL_MIN"]
 SECRET_KEYS = ("QQ_APPID", "QQ_APPSECRET")
+MIN_INTERVAL = 10
 
 
 # ---- 交互辅助 ----
@@ -107,7 +109,7 @@ def ensure_server(is_first_run):
         sys.exit(1)
     subprocess.run(["uvx", "mcp-server-12306"], input="", text=True, timeout=300)
     if not server_ready():
-        print("mcp-server-12306 启动失败，请在powershell中手动执行：uvx mcp-server-12306")
+        print("mcp-server-12306 启动失败，请在powershell中手动执行：uvx mcp-server-12306(此命令依赖uv)")
         sys.exit(1)
 
 
@@ -272,15 +274,16 @@ def choose_seat(keys):
 
 def ask_interval(default):
     while True:
-        s = ask("查询间隔（最低 10min一次）", default) 
-        # 【法律与安全警告】修改此处的查询间隔存在导致IP/账号被12306风控封禁的风险。
+        s = ask(f"查询间隔（最低 {MIN_INTERVAL}min一次）", default)
+        # 【法律与安全警告】修改查询间隔常量存在导致IP/账号被12306风控封禁的风险。
         # 作者已设定最低10分钟的安全阈值。若您强行修改此值，即表示：
         # 1. 您已完全阅读并理解本项目的免责声明（https://github.com/Nanshan-1314/12306-ticket-monitor-qqbot/blob/main/DISCLAIMER.md）；
         # 2. 您明确知晓该行为可能违反第三方平台服务协议；
         # 3. 您自愿承担由此导致的一切账号封禁、IP屏蔽及潜在和连带的法律后果。
-        if s.isdigit() and int(s) >= 10:
+        # 4. 请善待12306公共资源
+        if s.isdigit() and int(s) >= MIN_INTERVAL:
             return s
-        print("间隔需为不小于 10 的整数。")
+        print(f"间隔需为不小于 {MIN_INTERVAL} 的整数。")
 
 
 def setup_openid(cfg):
@@ -311,14 +314,17 @@ def run_setup(cfg):
     print("=" * 40)
     ensure_server(is_first_run)
     cfg = setup_qq(cfg)
-    cfg = setup_query(cfg)
+    mode = choose_mode()
+    cfg["MODE"] = mode
     cfg = setup_openid(cfg)
-    print("3 秒后发送测试消息…")
-    time.sleep(3)
-    try:
-        send_test(cfg)
-    except RuntimeError as e:
-        print(f"测试消息发送失败: {e}")
+    if mode == "A":
+        cfg = setup_query(cfg)
+        print("3 秒后发送测试消息…")
+        time.sleep(3)
+        try:
+            send_test(cfg)
+        except RuntimeError as e:
+            print(f"测试消息发送失败: {e}")
     write_env(cfg)
     return cfg
 
@@ -380,6 +386,227 @@ def run_loop(cfg):
         time.sleep(interval)
 
 
+# ---- QQbot 模式 ----
+
+def choose_mode():
+    print("\n—— 选择运行模式 ——")
+    print("  A. 单次使用模式（终端定时监控，现有功能）")
+    print("  B. QQbot 模式（通过 bot 指令远程控制）")
+    while True:
+        s = input("请选择 A/B: ").strip().upper()
+        if s in ("A", "B"):
+            return s
+        print("无效选择，请输入 A 或 B。")
+
+
+def query_configured(cfg):
+    return all(cfg.get(k) for k in ("FROM_STATION", "TO_STATION", "TRAIN_NO",
+                                    "TRAIN_DATE", "SEAT_KEY", "INTERVAL_MIN"))
+
+
+class QQBotController:
+    """QQ 指令控制：/start /Refresh now /Rate limit [int] /stop。"""
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.owner = cfg.get("QQ_OPENID", "")
+        self.lock = threading.Lock()
+        self.interval_min = int(cfg.get("INTERVAL_MIN", MIN_INTERVAL))
+        self.stop_event = threading.Event()
+        self.monitor_thread = None
+        self.start_step = None
+        self.tmp = {}
+        self.refresh_times = []
+        self.refresh_limit = 2
+        self.refresh_window = 10 * 60
+
+    async def handle(self, openid, content):
+        if openid != self.owner:
+            return None
+        c = content.strip()
+        low = c.lower()
+        if low == "/start":
+            return self.cmd_start()
+        if low == "/stop":
+            return self.cmd_stop()
+        if low.startswith("/refresh"):
+            return await self.cmd_refresh()
+        if low.startswith("/rate"):
+            return self.cmd_rate(c)
+        if self.start_step is not None:
+            return await self.cmd_start_step(c)
+        return "未知命令。可用：/start、/Refresh now、/Rate limit [int]、/stop"
+
+    # ---- /start ----
+    def cmd_start(self):
+        self._stop_monitor()
+        self.tmp = {}
+        self.start_step = "FROM_STATION"
+        return "开始初始化车次信息。\n请输入出发站："
+
+    async def cmd_start_step(self, text):
+        step = self.start_step
+        if step == "FROM_STATION":
+            self.tmp["FROM_STATION"] = text.strip()
+            self.start_step = "TO_STATION"
+            return "请输入到达站："
+        if step == "TO_STATION":
+            self.tmp["TO_STATION"] = text.strip()
+            self.start_step = "TRAIN_NO"
+            return "请输入车次（如 T520）："
+        if step == "TRAIN_NO":
+            self.tmp["TRAIN_NO"] = text.strip().upper()
+            if self.tmp.get("TRAIN_DATE"):
+                return await self._fetch_seats()
+            self.start_step = "TRAIN_DATE"
+            return "请输入出发日期（格式 2026/5/20）："
+        if step == "TRAIN_DATE":
+            d = normalize_date(text)
+            if not d:
+                return "日期格式无效，请用 yyyy/m/d，重新输入："
+            self.tmp["TRAIN_DATE"] = d
+            return await self._fetch_seats()
+        if step == "SEAT":
+            if not text.strip().isdigit():
+                return "请回复席别序号："
+            keys = self.tmp.get("seat_keys", [])
+            idx = int(text.strip()) - 1
+            if not (0 <= idx < len(keys)):
+                return "序号无效，请重新回复："
+            self.tmp["SEAT_KEY"] = keys[idx]
+            self.tmp["SEAT_NAME"] = SEAT_NAMES.get(keys[idx], keys[idx])
+            self.start_step = "INTERVAL"
+            return f"已选择 {self.tmp['SEAT_NAME']}。请输入查询间隔（分钟，≥{MIN_INTERVAL}）："
+        if step == "INTERVAL":
+            s = text.strip()
+            if not (s.isdigit() and int(s) >= MIN_INTERVAL):
+                return f"间隔需为不小于 {MIN_INTERVAL} 的整数，重新输入："
+            self.tmp["INTERVAL_MIN"] = s
+            self.start_step = None
+            with self.lock:
+                for k in ("FROM_STATION", "TO_STATION", "TRAIN_NO", "TRAIN_DATE",
+                          "SEAT_KEY", "SEAT_NAME", "INTERVAL_MIN"):
+                    self.cfg[k] = self.tmp[k]
+                self.interval_min = int(s)
+            self._start_monitor()
+            return (f"配置完成：{self.cfg['TRAIN_NO']} {self.cfg['FROM_STATION']}->{self.cfg['TO_STATION']} "
+                    f"{self.cfg['TRAIN_DATE']} {self.cfg['SEAT_NAME']}，每 {self.interval_min} 分钟查询一次。\n监控已启动。")
+        return "输入无效。"
+
+    async def _fetch_seats(self):
+        try:
+            keys = await asyncio.to_thread(fetch_seat_keys, self.tmp)
+        except RuntimeError as e:
+            self.start_step = "TRAIN_NO"
+            return f"未找到车次，请重新输入车次（{e}）："
+        if not keys:
+            self.start_step = None
+            self.tmp = {}
+            return "该车次暂无席别信息，已取消。"
+        self.tmp["seat_keys"] = keys
+        self.start_step = "SEAT"
+        lines = "\n".join(f"{i + 1}. {SEAT_NAMES.get(k, k)}" for i, k in enumerate(keys))
+        return f"该车次可选席别：\n{lines}\n请回复序号："
+
+    # ---- /Refresh now ----
+    async def cmd_refresh(self):
+        if not query_configured(self.cfg):
+            return "尚未初始化车次信息，请先发送 /start。"
+        now = time.time()
+        self.refresh_times = [t for t in self.refresh_times if now - t < self.refresh_window]
+        if len(self.refresh_times) >= self.refresh_limit:
+            return "操作过于频繁，/Refresh now 每 10 分钟最多 2 次，请稍后再试。"
+        self.refresh_times.append(now)
+        with self.lock:
+            snapshot = dict(self.cfg)
+        try:
+            v = await asyncio.to_thread(check_ticket, snapshot)
+        except Exception as e:
+            return f"查询失败：{e}"
+        seat = snapshot.get("SEAT_NAME") or snapshot.get("SEAT_KEY")
+        if is_available(v):
+            try:
+                await asyncio.to_thread(send_notify, snapshot)
+            except Exception as e:
+                return f"已查到有票，但通知发送失败：{e}"
+            self._stop_monitor()
+            return f"{snapshot['TRAIN_NO']} {seat} 当前有票（{v}），已发送通知并停止监控。"
+        return f"{snapshot['TRAIN_NO']} {seat} 当前：{v}（暂无余票）"
+
+    # ---- /Rate limit ----
+    def cmd_rate(self, text):
+        num = None
+        for p in text.split()[1:]:
+            if p.isdigit():
+                num = int(p)
+                break
+        if num is None:
+            return f"用法：/Rate limit [int]，例如 /Rate limit 15（不得低于 {MIN_INTERVAL}）"
+        if num < MIN_INTERVAL:
+            return f"间隔不得低于 {MIN_INTERVAL} 分钟。"
+        with self.lock:
+            self.interval_min = num
+            self.cfg["INTERVAL_MIN"] = str(num)
+        return f"查询间隔已调整为 {num} 分钟。"
+
+    # ---- /stop ----
+    def cmd_stop(self):
+        self._stop_monitor()
+        return "监控已停止。可随时 /start 重新启动。"
+
+    # ---- 后台监控 ----
+    def _start_monitor(self):
+        with self.lock:
+            if self.monitor_thread and self.monitor_thread.is_alive():
+                return
+            self.stop_event.clear()
+            self.monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
+            self.monitor_thread.start()
+
+    def _stop_monitor(self):
+        self.stop_event.set()
+        with self.lock:
+            t = self.monitor_thread
+            self.monitor_thread = None
+        if t:
+            t.join(timeout=1)
+
+    def _monitor_loop(self):
+        notified = False
+        while not self.stop_event.is_set():
+            with self.lock:
+                snapshot = dict(self.cfg)
+                interval = self.interval_min
+            try:
+                v = check_ticket(snapshot)
+                cur = is_available(v)
+                if cur and not notified:
+                    send_notify(snapshot)
+                    notified = True
+                if not cur:
+                    notified = False
+            except Exception as e:
+                print(f"[监控] 错误: {e}", flush=True)
+            self.stop_event.wait(interval * 60)
+
+
+def qqbot_mode(cfg):
+    token = qqbot.get_access_token(cfg["QQ_APPID"], cfg["QQ_APPSECRET"])
+    controller = QQBotController(cfg)
+    print("QQbot 模式已启动，等待指令…（/start /Refresh now /Rate limit [int] /stop）")
+    try:
+        asyncio.run(qqbot.listen_c2c(token, api_base_for(cfg), controller.handle))
+    except KeyboardInterrupt:
+        print("\n已退出")
+
+
+def _start(cfg):
+    if cfg.get("MODE") == "B":
+        qqbot_mode(cfg)
+    else:
+        run_loop(cfg)
+
+
 def configured(cfg):
     return all(cfg.get(k) for k in REQUIRED)
 
@@ -395,25 +622,26 @@ def main():
         cfg["QQ_ENV"] = "prod"
 
     if "--setup" in args:
-        run_setup(cfg)
-        print("\n配置完成。运行 python main.py 开始监控。")
+        cfg = run_setup(cfg)
+        _start(cfg)
         return
 
     if "--test-send" in args:
-        if qq_configured(cfg):
-            send_test(cfg)
-        else:
-            run_setup(cfg)
+        if not qq_configured(cfg):
+            cfg = run_setup(cfg)
+        send_test(cfg)
         return
 
-    if not configured(cfg):
-        cfg = run_setup(cfg)
-
     if "--once" in args:
+        if not query_configured(cfg):
+            cfg = run_setup(cfg)
         run_once(cfg)
         return
 
-    run_loop(cfg)
+    if not qq_configured(cfg):
+        cfg = run_setup(cfg)
+
+    _start(cfg)
 
 
 if __name__ == "__main__":

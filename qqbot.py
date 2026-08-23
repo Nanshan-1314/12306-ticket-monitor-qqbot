@@ -102,3 +102,57 @@ async def capture_openid(token, api_base, timeout=300):
                     except (asyncio.CancelledError, Exception):
                         pass
             return result
+
+
+async def listen_c2c(token, api_base, on_message):
+    """持久监听 C2C 消息，每条消息调用 on_message(openid, content) 获取回复文本并发送。"""
+    gateway = get_gateway(token, api_base)
+    async with aiohttp.ClientSession() as session:
+        async with session.ws_connect(gateway, autoping=True) as ws:
+            state = {"seq": None, "hb": 45000, "hb_task": None}
+
+            async def heartbeat():
+                await asyncio.sleep(state["hb"] / 1000)
+                while True:
+                    try:
+                        await ws.send_json({"op": 1, "d": state["seq"]})
+                    except Exception:
+                        return
+                    await asyncio.sleep(state["hb"] / 1000)
+
+            try:
+                async for m in ws:
+                    if m.type != aiohttp.WSMsgType.TEXT:
+                        continue
+                    msg = json.loads(m.data)
+                    op = msg.get("op")
+                    if msg.get("s") is not None:
+                        state["seq"] = msg["s"]
+                    if op == 10:
+                        state["hb"] = (msg.get("d") or {}).get("heartbeat_interval", 45000)
+                        await ws.send_json({
+                            "op": 2,
+                            "d": {"token": f"QQBot {token}", "intents": INTENT, "shard": [0, 1]},
+                        })
+                        state["hb_task"] = asyncio.create_task(heartbeat())
+                    elif op == 0 and msg.get("t") == "C2C_MESSAGE_CREATE":
+                        d = msg.get("d") or {}
+                        author = d.get("author") or {}
+                        openid = author.get("user_openid") or author.get("id")
+                        content = (d.get("content") or "").strip()
+                        if openid and content:
+                            try:
+                                reply = await on_message(openid, content)
+                            except Exception as e:
+                                reply = f"处理失败: {e}"
+                            if reply:
+                                await asyncio.to_thread(send_c2c, token, openid, reply, api_base)
+                    elif m.type == aiohttp.WSMsgType.ERROR:
+                        break
+            finally:
+                if state["hb_task"]:
+                    state["hb_task"].cancel()
+                    try:
+                        await state["hb_task"]
+                    except (asyncio.CancelledError, Exception):
+                        pass
